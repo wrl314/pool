@@ -44,11 +44,10 @@ module Data.Pool
     , stats
     ) where
 
-import Control.Applicative ((<$>), (<*>))
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, onException, mask_)
-import Control.Monad (forM_, forever, join, liftM5, unless, when)
+import Control.Monad (forM_, forever, join, unless, when)
 import Data.Hashable (hash)
 import Data.IORef (IORef, newIORef, mkWeakIORef)
 import Data.List (partition)
@@ -87,9 +86,13 @@ data Entry a = Entry {
 -- | Stats for a single 'LocalPool'.
 data PoolStats = PoolStats {
       highwaterUsage :: Int
-    -- ^ Highest usage since last reset.
+    -- ^ Highest value of 'currentUsage' since last reset.
     , currentUsage   :: Int
-    -- ^ Current number of items.
+    -- ^ Current number of items (both idle and in use).
+    , currentIdle    :: Int
+    -- ^ Current number of items idle.
+    , currentNonIdle :: Int
+    -- ^ Current number of items that are not idle.
     , takes          :: Int
     -- ^ Number of takes since last reset.
     , creates        :: Int
@@ -427,15 +430,18 @@ destroyAllResources Pool{..} = V.forM_ localPools $ purgeLocalPool destroy
 stats :: Pool a -> Bool -> IO Stats
 stats Pool{..} reset = do 
   let stripeStats LocalPool{..} = atomically $ do
-                                    s <- liftM5 PoolStats (readTVar highwaterVar) (readTVar inUse) (readTVar takeVar) (readTVar createVar) (readTVar createFailureVar)
+                                    is <- readTVar inUse
+                                    idle <- length <$> readTVar entries
+                                    let nonIdle = is - idle
+                                    s <- PoolStats <$> readTVar highwaterVar <*> pure is <*> pure idle <*> pure nonIdle <*> readTVar takeVar <*> readTVar createVar <*> readTVar createFailureVar
                                     when reset $ do
                                                  mapM_ (\v -> writeTVar v 0) [takeVar, createVar, createFailureVar] 
                                                  writeTVar highwaterVar $! currentUsage s
                                     return s
 
   per <- V.mapM stripeStats localPools
-  let poolWide = V.foldr merge (PoolStats 0 0 0 0 0) per
-      merge (PoolStats hw1 cu1 t1 c1 f1) (PoolStats hw2 cu2 t2 c2 f2) = PoolStats (hw1 + hw2) (cu1 + cu2) (t1 + t2) (c1 + c2) (f1 + f2)
+  let poolWide = V.foldr merge (PoolStats 0 0 0 0 0 0 0) per
+      merge (PoolStats hw1 cu1 i1 ni1 t1 c1 f1) (PoolStats hw2 cu2 i2 ni2 t2 c2 f2) = PoolStats (hw1 + hw2) (cu1 + cu2) (i1 + i2) (ni1 + ni2) (t1 + t2) (c1 + c2) (f1 + f2)
   return $ Stats per poolWide
 
 modifyTVar_ :: TVar a -> (a -> a) -> STM ()
